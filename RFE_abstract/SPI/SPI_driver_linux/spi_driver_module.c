@@ -49,6 +49,8 @@ MODULE_ALIAS("RSDK_SPI");
 #define REGPROT_GCR_UAA_MASK_U32    0x00800000UL
 #define GCR_OFFSET_U32              0x900UL
 
+#define RSDK_SPI_DEVS_NUM 2U
+
 /*==================================================================================================
 *                                             ENUMS
 ==================================================================================================*/
@@ -71,24 +73,25 @@ static const struct of_device_id gsSpiMatch[] = {
     {},
 };
 
-spiDevice_t spiDevice;
+// spiDevice_t spiDevice;
 /*==================================================================================================
 *                                       FUNCTIONS
 ==================================================================================================*/
 static int32_t SpiMemMmap(struct file *filp, struct vm_area_struct *vma)
 {
+    spiDevice_t *pSpiDevice = (spiDevice_t *)filp->private_data;
     size_t size = vma->vm_end - vma->vm_start;
 
-    if ((vma->vm_pgoff > spiDevice.dtsInfo.memSize) || (size > (spiDevice.dtsInfo.memSize - vma->vm_pgoff)))
+    if ((vma->vm_pgoff > pSpiDevice->dtsInfo.memSize) || (size > (pSpiDevice->dtsInfo.memSize - vma->vm_pgoff)))
     {
-        PR_ERR("rsdk_spi_driver: SpiMemMmap: offset: %lu memSize %lld size %lu", vma->vm_pgoff, spiDevice.dtsInfo.memSize, size);
+        PR_ERR("rsdk_spi_driver: SpiMemMmap: offset: %lu memSize %lld size %lu", vma->vm_pgoff, pSpiDevice->dtsInfo.memSize, size);
         return -EINVAL;
     }
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
-	vma->vm_pgoff += ((uintptr_t)spiDevice.dtsInfo.pMemMapBaseAddr >> PAGE_SHIFT);
-	PR_ALERT("rsdk_spi_driver: SpiMemMmap: Map %lx bytes: phys 0x%lx to virt 0x%lx\n", size, (uintptr_t)spiDevice.dtsInfo.pMemMapBaseAddr, vma->vm_start);
+	vma->vm_pgoff += ((uintptr_t)pSpiDevice->dtsInfo.pMemMapBaseAddr >> PAGE_SHIFT);
+	PR_ALERT("rsdk_spi_driver: SpiMemMmap: Map %lx bytes: phys 0x%lx to virt 0x%lx\n", size, (uintptr_t)pSpiDevice->dtsInfo.pMemMapBaseAddr, vma->vm_start);
 
 	if (io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff, vma->vm_end - vma->vm_start, vma->vm_page_prot))
     {
@@ -185,44 +188,59 @@ static int SpiProbe(struct platform_device *pPlatDev)
     struct device_node *pNode = pPlatDev->dev.of_node;
     struct device *     pSysFsDev;
     uint32_t *          regProt;
+    dev_t DevNo;
+    spiDevice_t         *pSpiDevice;
 
     PR_ALERT("rsdk_spi_driver: SpiProbe: start");
-    BUG_ON((gNumSpiMajor == 0) || (gspSpiClass == NULL));
+    pSpiDevice = devm_kzalloc(&pPlatDev->dev, sizeof(spiDevice_t), GFP_KERNEL);
 
-    if (RsdkSpiGetDtsProperties(pNode, &spiDevice.dtsInfo) != 0)
-    {
-        PR_ERR("rsdk_spi_driver: SpiProbe: RsdkSpiGetDtsProperties failed.\n");
-        return -EINVAL;
+    if (pSpiDevice == NULL) {
+        PR_ERR("rsdk_spi_driver : failed to allocate rsdk_spi_dev\n");
+        err = -ENOMEM;
     }
+    else {
+        PR_ALERT("rsdk_spi_driver: SpiProbe: start");
+        BUG_ON((gNumSpiMajor == 0) || (gspSpiClass == NULL));
+
+        if (RsdkSpiGetDtsProperties(pNode, &pSpiDevice->dtsInfo) != 0)
+        {
+            PR_ERR("rsdk_spi_driver: SpiProbe: RsdkSpiGetDtsProperties failed.\n");
+            return -EINVAL;
+        }
+
+        DevNo = MKDEV(gNumSpiMajor, gNumSpiMinor + pSpiDevice->dtsInfo.devId);
+        dev_set_drvdata(pDevice, pSpiDevice);
+        cdev_init(&pSpiDevice->cdevice, &gSpiFileOps);
+        err = cdev_add(&pSpiDevice->cdevice, DevNo, 1);
+        if (err < 0)
+        {
+            PR_ERR("rsdk_spi_driver: SpiProbe: cdev_add: %d", err);
+            return err;
+        }
+
+        PR_ERR("rsdk_spi_driver: DevNo:%d.%d name %s%d\n", MAJOR(DevNo), MINOR(DevNo), DEVICE_NAME, pSpiDevice->dtsInfo.devId);
+        pSysFsDev = device_create(gspSpiClass, pDevice, DevNo, NULL, "%s%d", DEVICE_NAME, pSpiDevice->dtsInfo.devId);
         
-    dev_set_drvdata(pDevice, &spiDevice);
-    cdev_init(&spiDevice.cdevice, &gSpiFileOps);
-    err = cdev_add(&spiDevice.cdevice, devNum, 1);
-    if (err < 0)
-    {
-        PR_ERR("rsdk_spi_driver: SpiProbe: cdev_add: %d", err);
-        return err;
+        if (IS_ERR(pSysFsDev))
+        {
+            err = PTR_ERR(pSysFsDev);
+            PR_ERR("rsdk_spi_driver: SpiProbe: device_create: %d", err);
+            cdev_del(&pSpiDevice->cdevice);
+            return err;
+        }
+
+        // Allow register access from user space
+        regProt = (uint32_t *)ioremap((phys_addr_t)(pSpiDevice->dtsInfo.pMemMapBaseAddr + GCR_OFFSET_U32), (size_t)SPI_IP_PROT_MEM_U32);
+        if (regProt == NULL)
+        {
+            PR_ERR("rsdk_spi_driver: SpiProbe: ioremap");
+            device_destroy(gspSpiClass, DevNo);
+            cdev_del(&pSpiDevice->cdevice);
+            return EFAULT;
+        }
+        *(regProt) |= REGPROT_GCR_UAA_MASK_U32;
+        iounmap(regProt);
     }
-    pSysFsDev = device_create(gspSpiClass, pDevice, devNum, NULL, DEVICE_NAME);
-    if (IS_ERR(pSysFsDev))
-    {
-        err = PTR_ERR(pSysFsDev);
-        PR_ERR("rsdk_spi_driver: SpiProbe: device_create: %d", err);
-        cdev_del(&spiDevice.cdevice);
-        return err;
-    }
-  
-    // Allow register access from user space
-    regProt = (uint32_t *)ioremap((phys_addr_t)(spiDevice.dtsInfo.pMemMapBaseAddr + GCR_OFFSET_U32), (size_t)SPI_IP_PROT_MEM_U32);
-    if (regProt == NULL)
-    {
-        PR_ERR("rsdk_spi_driver: SpiProbe: ioremap");
-        device_destroy(gspSpiClass, devNum);
-        cdev_del(&spiDevice.cdevice);
-        return EFAULT;
-    }
-    *(regProt) |= REGPROT_GCR_UAA_MASK_U32;
-    iounmap(regProt);
     
     return err;
 }
@@ -233,8 +251,11 @@ static int SpiProbe(struct platform_device *pPlatDev)
 static int SpiRemove(struct platform_device *ofpdev)
 {
     spiDevice_t *pSpiDev = dev_get_drvdata(&ofpdev->dev);
+
+    BUG_ON((pSpiDev == NULL) || (gspSpiClass == NULL));
+
     dev_set_drvdata(&ofpdev->dev, NULL);
-    device_destroy(gspSpiClass, devNum);
+    device_destroy(gspSpiClass, MKDEV(gNumSpiMajor, gNumSpiMinor + pSpiDev->dtsInfo.devId));
     cdev_del(&pSpiDev->cdevice);
     PR_ALERT("rsdk_spi_driver: SpiRemove done.\n");
     return 0;
@@ -243,7 +264,7 @@ static int SpiRemove(struct platform_device *ofpdev)
 static struct platform_driver gsSpiDriver = {
     .driver =
         {
-            .name = "nxp-resdk_spi",
+            .name = "nxp-rsdk_spi",
             .owner = THIS_MODULE,
             .of_match_table = gsSpiMatch,
         },
@@ -258,7 +279,7 @@ static int __init SPIModuleInit(void)
 {
     int err = 0;
 
-    err = alloc_chrdev_region(&devNum, 0, 1, DEVICE_NAME);
+    err = alloc_chrdev_region(&devNum, 0, RSDK_SPI_DEVS_NUM, DEVICE_NAME);
     if (err != 0)
     {
         PR_ERR("rsdk_spi_driver: SPIModuleInit: alloc_chrdev_region: %d\n", err);
@@ -270,7 +291,7 @@ static int __init SPIModuleInit(void)
     gspSpiClass = class_create(THIS_MODULE, DEVICE_NAME);
     if (IS_ERR(gspSpiClass))
     {
-        unregister_chrdev_region(gNumSpiMajor, 0);
+        unregister_chrdev_region(devNum, RSDK_SPI_DEVS_NUM);
         err = PTR_ERR(gspSpiClass);
         PR_ERR("rsdk_spi_driver: SPIModuleInit: class_create: %d\n", err);
         return err;
@@ -280,7 +301,7 @@ static int __init SPIModuleInit(void)
     if (err != 0)
     {
         class_destroy(gspSpiClass);
-        unregister_chrdev_region(gNumSpiMajor, 1);        
+        unregister_chrdev_region(devNum, RSDK_SPI_DEVS_NUM);        
         PR_ERR("rsdk_spi_driver: SPIModuleInit: platform_driver_register: %d\n", err);
         return err;
     }
@@ -296,7 +317,7 @@ static void __exit SPIModuleExit(void)
 {
     platform_driver_unregister(&gsSpiDriver);
     class_destroy(gspSpiClass);
-    unregister_chrdev_region(devNum, 1);
+    unregister_chrdev_region(devNum, RSDK_SPI_DEVS_NUM);
     PR_ALERT("rsdk_spi_driver: SPIModuleExit: SPI driver exit. \n");
 }
 
